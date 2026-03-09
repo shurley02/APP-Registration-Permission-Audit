@@ -20,7 +20,7 @@ It pulls the list of granted permissions from the Graph API, queries your Log An
 | **Log Analytics Workspace** | Any Azure subscription — no premium tier required |
 | **App Registration** | Free — one auditor app registration with two API permissions |
 
-> **Note:** A free Azure account is sufficient for the Log Analytics workspace. The only hard licensing requirement is Entra ID P1 or higher, which is included in Microsoft 365 E3/E5, EMS E3/E5, or available as a standalone add-on (~$6/user/month).
+> **Note:** A free Azure account is sufficient for the Log Analytics workspace. The only hard licensing requirement is Entra ID P1 or higher, which is included in Microsoft 365 E3/E5, EMS E3/E5, or available as a standalone add-on.
 
 ### Data & Cost Considerations
 
