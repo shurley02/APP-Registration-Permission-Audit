@@ -1,0 +1,756 @@
+# ================================================================
+#  Invoke-AppPermissionAudit.ps1
+#  Audits Entra ID App Registration API permissions against
+#  actual usage in MicrosoftGraphActivityLogs (Log Analytics)
+#  and produces color-coded HTML reports.
+#
+#  MODES:
+#    -TargetAppId     Single App ID (original mode)
+#    -AppIdList       Comma-separated list of App IDs
+#    -InputFile       Path to CSV (AppId column) or TXT (one per line)
+#    -DiscoverAll     Auto-discover all admin-managed app registrations
+#
+#  Requirements:
+#    - PowerShell 5.1 or 7+
+#    - App Registration with:
+#        Application.Read.All  (Microsoft Graph)
+#        Data.Read             (Log Analytics API)
+#    - Log Analytics Reader RBAC on the workspace
+# ================================================================
+
+param (
+    # ---- Input Modes (use one) ----
+    [string]   $TargetAppId,                    # Single App ID
+    [string[]] $AppIdList,                      # Array of App IDs
+    [string]   $InputFile,                      # CSV or TXT file path
+    [switch]   $DiscoverAll,                    # Auto-discover all admin-managed apps
+
+    # ---- Auditor Credentials ----
+    [string]$TenantId        = "<your-tenant-id>",
+    [string]$ClientId        = "<your-auditor-app-client-id>",
+    [string]$ClientSecret    = "<your-auditor-app-client-secret>",
+    [string]$WorkspaceId     = "<your-log-analytics-workspace-id>",
+
+    # ---- Options ----
+    [int]   $LookbackDays    = 90,
+    [string]$OutputFolder    = $PSScriptRoot,
+    [switch]$SkipIndividualReports              # Only generate the summary report
+)
+
+# ================================================================
+# WELL-KNOWN MICROSOFT FIRST-PARTY APP IDS TO EXCLUDE
+# ================================================================
+$MicrosoftAppIds = @(
+    "00000003-0000-0000-c000-000000000000", # Microsoft Graph
+    "00000002-0000-0000-c000-000000000000", # Azure Active Directory
+    "00000001-0000-0000-c000-000000000000", # Azure ESTS Service
+    "00000007-0000-0000-c000-000000000000", # Common Data Service
+    "00000002-0000-0ff1-ce00-000000000000", # Exchange Online
+    "00000003-0000-0ff1-ce00-000000000000", # SharePoint Online
+    "00000006-0000-0ff1-ce00-000000000000", # Microsoft Office
+    "4345a7b9-9a63-4910-a426-35363201d503", # O365 Suite UX
+    "00000004-0000-0ff1-ce00-000000000000", # Skype for Business
+    "cc15fd57-2c6c-4117-a88c-83b1d56b4bbe", # Microsoft Teams
+    "1fec8e78-bce4-4aaf-ab1b-5451cc387264", # Microsoft Teams
+    "5e3ce6c0-2b1f-4285-8d4b-75ee78787346", # Microsoft Teams Web Client
+    "57fb890c-0dab-4253-a5e0-7188c88b2bb4", # SharePoint Online Client
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c", # Microsoft Office
+    "ab9b8c07-8f02-4f72-87fa-80105867a763", # OneDrive
+    "0000000c-0000-0000-c000-000000000000", # Microsoft App Access Panel
+    "89bee1f7-5e6e-4d8a-9f3d-ecd601259da7", # Office365 Shell WCSS-Client
+    "93d53678-613d-4013-afc1-62e9e444a0a5", # Office Online
+    "9bc3ab49-b65d-410a-85ad-de819febfddc", # SharePoint Online Tools
+    "c9a559d2-7aab-4f13-a6ed-e7e9c52aec87"  # Microsoft Forms
+)
+
+# ================================================================
+# PERMISSION URI MAP
+# ================================================================
+$PermissionUriMap = @(
+    @{ Uri = "graph.microsoft.com/v1.0/users";                          Method = "GET";    Permission = "User.Read.All";                           Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/users";                          Method = "POST";   Permission = "User.ReadWrite.All";                      Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/me";                             Method = "GET";    Permission = "User.Read";                               Type = "Delegated"   },
+    @{ Uri = "graph.microsoft.com/v1.0/groups";                         Method = "GET";    Permission = "Group.Read.All";                          Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/groups";                         Method = "POST";   Permission = "Group.ReadWrite.All";                     Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/directoryObjects";               Method = "GET";    Permission = "Directory.Read.All";                      Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/directoryRoles";                 Method = "GET";    Permission = "RoleManagement.Read.Directory";           Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/roleManagement";                 Method = "GET";    Permission = "RoleManagement.Read.Directory";           Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/applications";                   Method = "GET";    Permission = "Application.Read.All";                    Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/servicePrincipals";              Method = "GET";    Permission = "Application.Read.All";                    Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/auditLogs/signIns";              Method = "GET";    Permission = "AuditLog.Read.All";                       Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/auditLogs/directoryAudits";      Method = "GET";    Permission = "AuditLog.Read.All";                       Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/drives";                         Method = "GET";    Permission = "Files.Read.All";                          Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/sites";                          Method = "GET";    Permission = "Sites.Read.All";                          Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/teams";                          Method = "GET";    Permission = "Team.ReadBasic.All";                      Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/chats";                          Method = "GET";    Permission = "Chat.Read.All";                           Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/security/alerts";                Method = "GET";    Permission = "SecurityEvents.Read.All";                 Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/identityProtection/riskyUsers";  Method = "GET";    Permission = "IdentityRiskyUser.Read.All";              Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/contacts";                       Method = "GET";    Permission = "Contacts.Read";                           Type = "Delegated"   },
+    @{ Uri = "graph.microsoft.com/v1.0/users/{id}/messages";            Method = "GET";    Permission = "Mail.Read";                               Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/users/{id}/sendMail";            Method = "POST";   Permission = "Mail.Send";                               Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/users/{id}/calendar";            Method = "GET";    Permission = "Calendars.Read";                          Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/users/{id}/drive";               Method = "GET";    Permission = "Files.Read.All";                          Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/reports";                        Method = "GET";    Permission = "Reports.Read.All";                        Type = "Application" },
+    @{ Uri = "graph.microsoft.com/v1.0/deviceManagement";               Method = "GET";    Permission = "DeviceManagementManagedDevices.Read.All"; Type = "Application" }
+)
+
+# ================================================================
+# HELPER FUNCTIONS
+# ================================================================
+
+function Get-AccessToken {
+    param ([string]$Scope)
+    $body = @{
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        scope         = $Scope
+        grant_type    = "client_credentials"
+    }
+    $response = Invoke-RestMethod `
+        -Method Post `
+        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+        -ContentType "application/x-www-form-urlencoded" `
+        -Body $body
+    return $response.access_token
+}
+
+function Get-AllAdminManagedApps {
+    param ([string]$Token)
+
+    Write-Host "  Discovering admin-managed app registrations..." -ForegroundColor Yellow
+    $headers = @{ Authorization = "Bearer $Token" }
+    $apps    = @()
+    $uri     = "https://graph.microsoft.com/v1.0/applications?`$select=id,appId,displayName,createdDateTime,passwordCredentials,keyCredentials,requiredResourceAccess&`$top=999"
+
+    do {
+        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+        $apps    += $response.value
+        $uri      = $response.'@odata.nextLink'
+    } while ($uri)
+
+    # Filter out Microsoft first-party apps and apps with no permissions configured
+    $filtered = $apps | Where-Object {
+        $_.appId -notin $MicrosoftAppIds -and
+        $_.requiredResourceAccess -and
+        $_.requiredResourceAccess.Count -gt 0
+    }
+
+    Write-Host "  Found $($filtered.Count) admin-managed app(s) (excluded $($apps.Count - $filtered.Count) Microsoft defaults)." -ForegroundColor Green
+    return $filtered
+}
+
+function Get-GrantedPermissions {
+    param ([string]$AppId, [string]$Token)
+
+    $headers     = @{ Authorization = "Bearer $Token" }
+    Add-Type -AssemblyName System.Web
+    $filterQuery = "appId eq '$AppId'"
+    $encoded     = [System.Web.HttpUtility]::UrlEncode($filterQuery)
+    $uri         = "https://graph.microsoft.com/v1.0/applications?`$filter=$encoded&`$select=id,displayName,appId,requiredResourceAccess,createdDateTime,passwordCredentials,keyCredentials"
+    $response    = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+
+    if (-not $response.value -or $response.value.Count -eq 0) {
+        Write-Warning "No application found with appId: $AppId"
+        return $null, $null, $null
+    }
+
+    $app         = $response.value[0]
+    $permissions = @()
+
+    foreach ($resource in $app.requiredResourceAccess) {
+        $spUri      = "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$($resource.resourceAppId)'&`$select=appId,displayName,oauth2PermissionScopes,appRoles"
+        $spResponse = Invoke-RestMethod -Method Get -Uri $spUri -Headers $headers
+        $sp         = $spResponse.value[0]
+
+        foreach ($access in $resource.resourceAccess) {
+            $permName = "Unknown ($($access.id))"
+            $permType = if ($access.type -eq "Role") { "Application" } else { "Delegated" }
+
+            if ($access.type -eq "Role") {
+                $match = $sp.appRoles | Where-Object { $_.id -eq $access.id }
+                if ($match) { $permName = $match.value }
+            } else {
+                $match = $sp.oauth2PermissionScopes | Where-Object { $_.id -eq $access.id }
+                if ($match) { $permName = $match.value }
+            }
+
+            $permissions += [PSCustomObject]@{
+                Permission   = $permName
+                Type         = $permType
+                ResourceName = $sp.displayName
+            }
+        }
+    }
+
+    # Credential info for summary
+    $hasSecret  = $app.passwordCredentials -and $app.passwordCredentials.Count -gt 0
+    $hasCert    = $app.keyCredentials -and $app.keyCredentials.Count -gt 0
+    $credType   = if ($hasSecret -and $hasCert) { "Secret + Certificate" }
+                  elseif ($hasSecret) { "Client Secret" }
+                  elseif ($hasCert)   { "Certificate" }
+                  else                { "None" }
+
+    $appMeta = [PSCustomObject]@{
+        DisplayName   = $app.displayName
+        AppId         = $app.appId
+        CreatedDate   = if ($app.createdDateTime) { [datetime]$app.createdDateTime } else { $null }
+        CredentialType = $credType
+    }
+
+    return $app.displayName, $permissions, $appMeta
+}
+
+function Get-LogAnalyticsUsage {
+    param ([string]$AppId, [string]$Token)
+
+    $query = @"
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago($($LookbackDays)d)
+| where AppId == '$AppId'
+| extend NormalizedUri = replace_regex(tostring(split(RequestUri, "?")[0]),
+    @'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '{id}')
+| extend PermissionType = case(
+    isempty(UserId), "Application",
+    UserId == "00000000-0000-0000-0000-000000000000", "Application",
+    "Delegated")
+| summarize
+    CallCount = count(),
+    LastUsed  = max(TimeGenerated),
+    FailCount = countif(ResponseStatusCode >= 400)
+    by NormalizedUri, RequestMethod, PermissionType
+| order by CallCount desc
+"@
+
+    $body    = @{ query = $query } | ConvertTo-Json
+    $headers = @{ Authorization = "Bearer $Token"; "Content-Type" = "application/json" }
+    $uri     = "https://api.loganalytics.io/v1/workspaces/$WorkspaceId/query"
+
+    try {
+        $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body
+        $results  = @()
+        if ($response.tables -and $response.tables[0].rows) {
+            $cols = $response.tables[0].columns | ForEach-Object { $_.name }
+            foreach ($row in $response.tables[0].rows) {
+                $obj = [ordered]@{}
+                for ($i = 0; $i -lt $cols.Count; $i++) { $obj[$cols[$i]] = $row[$i] }
+                $results += [PSCustomObject]$obj
+            }
+        }
+        return $results
+    } catch {
+        Write-Warning "Log Analytics query failed for AppId $AppId : $_"
+        return @()
+    }
+}
+
+function Map-UriToPermission {
+    param ([string]$Uri, [string]$Method)
+    foreach ($entry in $PermissionUriMap) {
+        if ($Uri -like "*$($entry.Uri)*" -and $Method -eq $entry.Method) {
+            return $entry.Permission
+        }
+    }
+    return $null
+}
+
+function Invoke-SingleAppAudit {
+    param ([string]$AppId, [string]$GraphToken, [string]$LAToken)
+
+    Write-Host "  Auditing: $AppId" -ForegroundColor Yellow
+    $appName, $grantedPermissions, $appMeta = Get-GrantedPermissions -AppId $AppId -Token $GraphToken
+
+    if (-not $grantedPermissions) {
+        Write-Warning "  Skipping $AppId — could not retrieve permissions."
+        return $null
+    }
+
+    $usageData     = Get-LogAnalyticsUsage -AppId $AppId -Token $LAToken
+    $auditResults  = @()
+
+    foreach ($perm in $grantedPermissions) {
+        $matchingUsage = $usageData | Where-Object {
+            $mappedPerm = Map-UriToPermission -Uri $_.NormalizedUri -Method $_.RequestMethod
+            $mappedPerm -eq $perm.Permission
+        }
+        $totalCalls = ($matchingUsage | Measure-Object -Property CallCount -Sum).Sum
+        $totalFails = ($matchingUsage | Measure-Object -Property FailCount -Sum).Sum
+        $lastUsed   = ($matchingUsage | Sort-Object LastUsed -Descending | Select-Object -First 1).LastUsed
+
+        $auditResults += [PSCustomObject]@{
+            AppName      = $appName
+            AppId        = $AppId
+            Permission   = $perm.Permission
+            Type         = $perm.Type
+            Resource     = $perm.ResourceName
+            TotalCalls   = if ($totalCalls) { $totalCalls } else { 0 }
+            FailedCalls  = if ($totalFails) { $totalFails } else { 0 }
+            LastUsed     = if ($lastUsed) { [datetime]$lastUsed } else { $null }
+            Status       = if ($totalCalls -gt 0) { "Active" } else { "Never Used" }
+        }
+    }
+
+    $unmappedUris = $usageData | Where-Object {
+        -not (Map-UriToPermission -Uri $_.NormalizedUri -Method $_.RequestMethod)
+    }
+
+    return [PSCustomObject]@{
+        AppName       = $appName
+        AppId         = $AppId
+        AppMeta       = $appMeta
+        AuditResults  = $auditResults
+        UnmappedUris  = $unmappedUris
+        UsageData     = $usageData
+    }
+}
+
+# ================================================================
+# HTML GENERATION — INDIVIDUAL REPORT
+# ================================================================
+
+function New-IndividualReport {
+    param ($AuditData, [string]$OutputPath)
+
+    $appName        = $AuditData.AppName
+    $auditResults   = $AuditData.AuditResults
+    $unmappedUris   = $AuditData.UnmappedUris
+    $reportDate     = Get-Date -Format "MMMM dd, yyyy HH:mm"
+    $activeCount    = ($auditResults | Where-Object { $_.Status -eq "Active" }).Count
+    $neverUsedCount = ($auditResults | Where-Object { $_.Status -eq "Never Used" }).Count
+    $totalCalls     = ($auditResults | Measure-Object -Property TotalCalls -Sum).Sum
+
+    $permissionRows = ""
+    foreach ($r in $auditResults | Sort-Object Status, Permission) {
+        $statusBadge     = if ($r.Status -eq "Active") { '<span class="badge badge-active">Active</span>' } else { '<span class="badge badge-unused">Never Used</span>' }
+        $typeBadge       = if ($r.Type -eq "Application") { '<span class="badge badge-app">Application</span>' } else { '<span class="badge badge-del">Delegated</span>' }
+        $lastUsedDisplay = if ($r.LastUsed) { $r.LastUsed.ToString("yyyy-MM-dd HH:mm") } else { '<span class="never">—</span>' }
+        $failDisplay     = if ($r.FailedCalls -gt 0) { "<span class='fail-count'>$($r.FailedCalls)</span>" } else { "0" }
+        $rowClass        = if ($r.Status -eq "Never Used") { "row-unused" } else { "" }
+
+        $permissionRows += @"
+        <tr class="$rowClass">
+            <td><strong>$($r.Permission)</strong></td>
+            <td>$typeBadge</td>
+            <td>$($r.Resource)</td>
+            <td class="num">$($r.TotalCalls)</td>
+            <td class="num">$failDisplay</td>
+            <td>$lastUsedDisplay</td>
+            <td>$statusBadge</td>
+        </tr>
+"@
+    }
+
+    $unmappedRows = ""
+    if ($unmappedUris -and $unmappedUris.Count -gt 0) {
+        foreach ($u in $unmappedUris) {
+            $lastUsedDisplay = if ($u.LastUsed) { ([datetime]$u.LastUsed).ToString("yyyy-MM-dd HH:mm") } else { "—" }
+            $unmappedRows += @"
+            <tr>
+                <td><code>$($u.RequestMethod) $($u.NormalizedUri)</code></td>
+                <td class="num">$($u.CallCount)</td>
+                <td>$lastUsedDisplay</td>
+                <td>$($u.PermissionType)</td>
+            </tr>
+"@
+        }
+    } else {
+        $unmappedRows = '<tr><td colspan="4" style="text-align:center;color:#888;">No unmapped URIs found.</td></tr>'
+    }
+
+    $unmappedCount = if ($unmappedUris) { $unmappedUris.Count } else { 0 }
+
+    $recommendationHtml = if ($neverUsedCount -gt 0) {
+        $neverUsedList = ($auditResults | Where-Object { $_.Status -eq "Never Used" } | ForEach-Object {
+            "          <li><strong>$($_.Permission)</strong> ($($_.Type))</li>"
+        }) -join "`n"
+        @"
+        <div class="recommendation">
+            <strong>⚠️ $neverUsedCount permission(s) have never been used</strong> in the last $LookbackDays days.<br><br>
+            Consider removing the following permissions after confirming with the application owner:<br><br>
+            <ul style="margin-left:20px;margin-top:8px;">$neverUsedList</ul>
+        </div>
+"@
+    } else {
+        '<p style="color:#27AE60;font-size:13px;">✅ All registered permissions have been observed in use during the lookback period.</p>'
+    }
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>App Permission Audit — $appName</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #1a1a2e; }
+  .header { background: linear-gradient(135deg, #1F4E79 0%, #2E75B6 100%); color: white; padding: 32px 40px; }
+  .header h1 { font-size: 26px; font-weight: 700; margin-bottom: 6px; }
+  .header .sub { font-size: 14px; opacity: 0.85; }
+  .header .appid { font-size: 12px; opacity: 0.7; font-family: monospace; margin-top: 4px; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 30px 20px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 30px; }
+  .summary-card { background: white; border-radius: 10px; padding: 20px 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); border-top: 4px solid #2E75B6; }
+  .summary-card.red { border-top-color: #C0392B; }
+  .summary-card.green { border-top-color: #27AE60; }
+  .summary-card.orange { border-top-color: #E67E22; }
+  .summary-card .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  .summary-card .value { font-size: 32px; font-weight: 700; color: #1F4E79; margin-top: 4px; }
+  .summary-card.red .value { color: #C0392B; }
+  .summary-card.green .value { color: #27AE60; }
+  .summary-card.orange .value { color: #E67E22; }
+  .section { background: white; border-radius: 10px; padding: 24px; margin-bottom: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); }
+  .section h2 { font-size: 16px; font-weight: 700; color: #1F4E79; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #D5E8F0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: #1F4E79; color: white; padding: 10px 14px; text-align: left; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  td { padding: 10px 14px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8fbff; }
+  tr.row-unused td { background: #fff8f8; }
+  tr.row-unused:hover td { background: #fff0f0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge-active { background: #E8F8F0; color: #1E8449; }
+  .badge-unused { background: #FDEDEC; color: #C0392B; }
+  .badge-app { background: #EBF5FB; color: #1A5276; }
+  .badge-del { background: #F4ECF7; color: #6C3483; }
+  .fail-count { color: #C0392B; font-weight: 700; }
+  .never { color: #ccc; }
+  code { font-family: 'Consolas', monospace; font-size: 12px; color: #444; }
+  .recommendation { background: #FFFBF0; border-left: 4px solid #E67E22; padding: 16px 20px; border-radius: 0 8px 8px 0; margin-top: 16px; font-size: 13px; line-height: 1.6; }
+  .recommendation strong { color: #E67E22; }
+  .back-link { margin-bottom: 20px; }
+  .back-link a { color: #2E75B6; text-decoration: none; font-size: 13px; }
+  .back-link a:hover { text-decoration: underline; }
+  .footer { text-align: center; padding: 20px; font-size: 12px; color: #aaa; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>App Permission Audit Report</h1>
+  <div class="sub">Application: <strong>$appName</strong></div>
+  <div class="appid">App ID: $($AuditData.AppId) &nbsp;|&nbsp; Lookback: $LookbackDays days &nbsp;|&nbsp; Generated: $reportDate</div>
+</div>
+<div class="container">
+  <div class="back-link"><a href="AuditSummary.html">← Back to Summary Report</a></div>
+  <div class="summary-grid">
+    <div class="summary-card"><div class="label">Registered Permissions</div><div class="value">$($auditResults.Count)</div></div>
+    <div class="summary-card green"><div class="label">Active Permissions</div><div class="value">$activeCount</div></div>
+    <div class="summary-card red"><div class="label">Never Used</div><div class="value">$neverUsedCount</div></div>
+    <div class="summary-card orange"><div class="label">Total API Calls ($LookbackDays d)</div><div class="value">$totalCalls</div></div>
+  </div>
+  <div class="section">
+    <h2>Registered Permissions vs. Observed Usage</h2>
+    <table>
+      <thead><tr><th>Permission</th><th>Type</th><th>Resource</th><th style="text-align:right">Total Calls</th><th style="text-align:right">Failed Calls</th><th>Last Used</th><th>Status</th></tr></thead>
+      <tbody>$permissionRows</tbody>
+    </table>
+  </div>
+  <div class="section">
+    <h2>API Calls Without a Matched Permission ($unmappedCount found)</h2>
+    <p style="font-size:13px;color:#666;margin-bottom:14px;">Endpoints observed in logs that could not be mapped to a known permission scope. Review and add to the permission map if needed.</p>
+    <table>
+      <thead><tr><th>Endpoint</th><th style="text-align:right">Calls</th><th>Last Used</th><th>Auth Type</th></tr></thead>
+      <tbody>$unmappedRows</tbody>
+    </table>
+  </div>
+  <div class="section">
+    <h2>Least Privilege Recommendations</h2>
+    $recommendationHtml
+    <div class="recommendation" style="background:#EBF5FB;border-color:#2E75B6;margin-top:12px;">
+      <strong>📋 Next Steps</strong><br><br>
+      1. Review never-used permissions with the application owner before removing.<br>
+      2. Extend the lookback period if the application runs infrequent scheduled tasks.<br>
+      3. Re-run this audit after removing permissions to confirm no application breakage.<br>
+      4. Schedule this script to run monthly for ongoing least-privilege governance.
+    </div>
+  </div>
+</div>
+<div class="footer">Entra ID App Permission Audit &nbsp;|&nbsp; Generated $reportDate &nbsp;|&nbsp; Lookback: $LookbackDays days</div>
+</body>
+</html>
+"@
+    $html | Out-File -FilePath $OutputPath -Encoding UTF8
+}
+
+# ================================================================
+# HTML GENERATION — SUMMARY REPORT
+# ================================================================
+
+function New-SummaryReport {
+    param ($AllAuditData, [string]$OutputPath)
+
+    $reportDate   = Get-Date -Format "MMMM dd, yyyy HH:mm"
+    $totalApps    = $AllAuditData.Count
+    $totalPerms   = ($AllAuditData | ForEach-Object { $_.AuditResults.Count } | Measure-Object -Sum).Sum
+    $totalNever   = ($AllAuditData | ForEach-Object { ($_.AuditResults | Where-Object { $_.Status -eq "Never Used" }).Count } | Measure-Object -Sum).Sum
+    $totalCalls   = ($AllAuditData | ForEach-Object { ($_.AuditResults | Measure-Object -Property TotalCalls -Sum).Sum } | Measure-Object -Sum).Sum
+    $riskApps     = ($AllAuditData | Where-Object { ($_.AuditResults | Where-Object { $_.Status -eq "Never Used" }).Count -gt 0 }).Count
+
+    # Build app summary rows
+    $appRows = ""
+    foreach ($data in $AllAuditData | Sort-Object { ($_.AuditResults | Where-Object { $_.Status -eq "Never Used" }).Count } -Descending) {
+        $appActiveCount   = ($data.AuditResults | Where-Object { $_.Status -eq "Active" }).Count
+        $appNeverCount    = ($data.AuditResults | Where-Object { $_.Status -eq "Never Used" }).Count
+        $appTotalCalls    = ($data.AuditResults | Measure-Object -Property TotalCalls -Sum).Sum
+        $appTotalPerms    = $data.AuditResults.Count
+        $appLastActivity  = ($data.AuditResults | Where-Object { $_.LastUsed } | Sort-Object LastUsed -Descending | Select-Object -First 1).LastUsed
+        $safeAppName      = $data.AppName -replace '[^a-zA-Z0-9]', '_'
+        $reportFileName   = "AppAudit_${safeAppName}.html"
+        $riskBadge        = if ($appNeverCount -gt 0) { '<span class="badge badge-risk">⚠️ Has Unused Perms</span>' } else { '<span class="badge badge-ok">✅ Clean</span>' }
+        $lastActivityDisplay = if ($appLastActivity) { ([datetime]$appLastActivity).ToString("yyyy-MM-dd") } else { '<span class="never">No activity</span>' }
+        $credType         = if ($data.AppMeta) { $data.AppMeta.CredentialType } else { "Unknown" }
+        $createdDate      = if ($data.AppMeta -and $data.AppMeta.CreatedDate) { $data.AppMeta.CreatedDate.ToString("yyyy-MM-dd") } else { "Unknown" }
+
+        $appRows += @"
+        <tr>
+            <td><a href="$reportFileName"><strong>$($data.AppName)</strong></a><br><span class="appid-small">$($data.AppId)</span></td>
+            <td>$createdDate</td>
+            <td>$credType</td>
+            <td class="num">$appTotalPerms</td>
+            <td class="num" style="color:#27AE60;font-weight:600;">$appActiveCount</td>
+            <td class="num" style="color:$(if($appNeverCount -gt 0){'#C0392B'}else{'inherit'});font-weight:$(if($appNeverCount -gt 0){'700'}else{'400'});">$appNeverCount</td>
+            <td class="num">$appTotalCalls</td>
+            <td>$lastActivityDisplay</td>
+            <td>$riskBadge</td>
+        </tr>
+"@
+    }
+
+    # Build never-used permissions roll-up
+    $neverUsedRows = ""
+    $allNeverUsed  = $AllAuditData | ForEach-Object {
+        $appName = $_.AppName
+        $appId   = $_.AppId
+        $_.AuditResults | Where-Object { $_.Status -eq "Never Used" } | ForEach-Object {
+            [PSCustomObject]@{ AppName = $appName; AppId = $appId; Permission = $_.Permission; Type = $_.Type; Resource = $_.Resource }
+        }
+    }
+
+    if ($allNeverUsed) {
+        foreach ($n in $allNeverUsed | Sort-Object AppName, Permission) {
+            $safeAppName    = $n.AppName -replace '[^a-zA-Z0-9]', '_'
+            $reportFileName = "AppAudit_${safeAppName}.html"
+            $typeBadge      = if ($n.Type -eq "Application") { '<span class="badge badge-app">Application</span>' } else { '<span class="badge badge-del">Delegated</span>' }
+            $neverUsedRows += @"
+            <tr class="row-unused">
+                <td><a href="$reportFileName">$($n.AppName)</a></td>
+                <td><strong>$($n.Permission)</strong></td>
+                <td>$typeBadge</td>
+                <td>$($n.Resource)</td>
+            </tr>
+"@
+        }
+    } else {
+        $neverUsedRows = '<tr><td colspan="4" style="text-align:center;color:#27AE60;">✅ No unused permissions found across all audited applications.</td></tr>'
+    }
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>App Permission Audit — Summary Report</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #1a1a2e; }
+  .header { background: linear-gradient(135deg, #1F4E79 0%, #2E75B6 100%); color: white; padding: 32px 40px; }
+  .header h1 { font-size: 26px; font-weight: 700; margin-bottom: 6px; }
+  .header .sub { font-size: 14px; opacity: 0.85; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 30px 20px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 30px; }
+  .summary-card { background: white; border-radius: 10px; padding: 20px 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); border-top: 4px solid #2E75B6; }
+  .summary-card.red { border-top-color: #C0392B; }
+  .summary-card.green { border-top-color: #27AE60; }
+  .summary-card.orange { border-top-color: #E67E22; }
+  .summary-card.purple { border-top-color: #8E44AD; }
+  .summary-card .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  .summary-card .value { font-size: 32px; font-weight: 700; color: #1F4E79; margin-top: 4px; }
+  .summary-card.red .value { color: #C0392B; }
+  .summary-card.green .value { color: #27AE60; }
+  .summary-card.orange .value { color: #E67E22; }
+  .summary-card.purple .value { color: #8E44AD; }
+  .section { background: white; border-radius: 10px; padding: 24px; margin-bottom: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); }
+  .section h2 { font-size: 16px; font-weight: 700; color: #1F4E79; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #D5E8F0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: #1F4E79; color: white; padding: 10px 14px; text-align: left; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  td { padding: 10px 14px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8fbff; }
+  tr.row-unused td { background: #fff8f8; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .appid-small { font-size: 11px; color: #aaa; font-family: monospace; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge-risk { background: #FDEDEC; color: #C0392B; }
+  .badge-ok { background: #E8F8F0; color: #1E8449; }
+  .badge-app { background: #EBF5FB; color: #1A5276; }
+  .badge-del { background: #F4ECF7; color: #6C3483; }
+  .never { color: #ccc; }
+  a { color: #2E75B6; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .footer { text-align: center; padding: 20px; font-size: 12px; color: #aaa; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>App Permission Audit — Summary Report</h1>
+  <div class="sub">Tenant-wide least privilege analysis &nbsp;|&nbsp; Lookback: $LookbackDays days &nbsp;|&nbsp; Generated: $reportDate</div>
+</div>
+<div class="container">
+  <div class="summary-grid">
+    <div class="summary-card"><div class="label">Apps Audited</div><div class="value">$totalApps</div></div>
+    <div class="summary-card purple"><div class="label">Apps With Unused Perms</div><div class="value">$riskApps</div></div>
+    <div class="summary-card orange"><div class="label">Total Permissions</div><div class="value">$totalPerms</div></div>
+    <div class="summary-card red"><div class="label">Never-Used Permissions</div><div class="value">$totalNever</div></div>
+    <div class="summary-card green"><div class="label">Total API Calls ($LookbackDays d)</div><div class="value">$totalCalls</div></div>
+  </div>
+
+  <div class="section">
+    <h2>All Audited Applications</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Application</th>
+          <th>Created</th>
+          <th>Credential Type</th>
+          <th style="text-align:right">Permissions</th>
+          <th style="text-align:right">Active</th>
+          <th style="text-align:right">Never Used</th>
+          <th style="text-align:right">Total Calls</th>
+          <th>Last Activity</th>
+          <th>Risk</th>
+        </tr>
+      </thead>
+      <tbody>$appRows</tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>Never-Used Permissions Across All Apps ($totalNever total)</h2>
+    <table>
+      <thead><tr><th>Application</th><th>Permission</th><th>Type</th><th>Resource</th></tr></thead>
+      <tbody>$neverUsedRows</tbody>
+    </table>
+  </div>
+</div>
+<div class="footer">Entra ID App Permission Audit — Summary &nbsp;|&nbsp; Generated $reportDate &nbsp;|&nbsp; Lookback: $LookbackDays days</div>
+</body>
+</html>
+"@
+    $html | Out-File -FilePath $OutputPath -Encoding UTF8
+}
+
+# ================================================================
+# MAIN EXECUTION
+# ================================================================
+
+Write-Host "`n================================================" -ForegroundColor Cyan
+Write-Host "  Entra ID App Permission Audit" -ForegroundColor Cyan
+Write-Host "  Lookback : $LookbackDays days" -ForegroundColor Cyan
+Write-Host "  Output   : $OutputFolder" -ForegroundColor Cyan
+Write-Host "================================================`n" -ForegroundColor Cyan
+
+# Validate at least one input mode is specified
+if (-not $TargetAppId -and -not $AppIdList -and -not $InputFile -and -not $DiscoverAll) {
+    Write-Error "Specify an input mode: -TargetAppId, -AppIdList, -InputFile, or -DiscoverAll"
+    exit 1
+}
+
+# Acquire tokens
+Write-Host "[1] Acquiring access tokens..." -ForegroundColor Yellow
+$graphToken = Get-AccessToken -Scope "https://graph.microsoft.com/.default"
+$laToken    = Get-AccessToken -Scope "https://api.loganalytics.io/.default"
+Write-Host "    Tokens acquired." -ForegroundColor Green
+
+# Build the list of App IDs to audit
+$appIdsToAudit = @()
+
+if ($TargetAppId) {
+    $appIdsToAudit += $TargetAppId
+}
+
+if ($AppIdList) {
+    $appIdsToAudit += $AppIdList
+}
+
+if ($InputFile) {
+    Write-Host "[2] Loading App IDs from file: $InputFile" -ForegroundColor Yellow
+    if (-not (Test-Path $InputFile)) {
+        Write-Error "Input file not found: $InputFile"
+        exit 1
+    }
+    $ext = [System.IO.Path]::GetExtension($InputFile).ToLower()
+    if ($ext -eq ".csv") {
+        $appIdsToAudit += (Import-Csv $InputFile).AppId | Where-Object { $_ }
+    } else {
+        $appIdsToAudit += Get-Content $InputFile | Where-Object { $_.Trim() -ne "" }
+    }
+    Write-Host "    Loaded $($appIdsToAudit.Count) App ID(s) from file." -ForegroundColor Green
+}
+
+if ($DiscoverAll) {
+    Write-Host "[2] Auto-discovering admin-managed app registrations..." -ForegroundColor Yellow
+    $discoveredApps = Get-AllAdminManagedApps -Token $graphToken
+    $appIdsToAudit  += $discoveredApps | ForEach-Object { $_.appId }
+    Write-Host "    Discovered $($discoveredApps.Count) app(s) to audit." -ForegroundColor Green
+}
+
+# Deduplicate
+$appIdsToAudit = $appIdsToAudit | Select-Object -Unique
+Write-Host "`n[3] Auditing $($appIdsToAudit.Count) application(s)..." -ForegroundColor Yellow
+
+# Ensure output folder exists
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder | Out-Null
+}
+
+# Run audit for each app
+$allAuditData = @()
+$counter      = 0
+
+foreach ($appId in $appIdsToAudit) {
+    $counter++
+    Write-Host "  [$counter/$($appIdsToAudit.Count)]" -NoNewline -ForegroundColor Gray
+    $auditData = Invoke-SingleAppAudit -AppId $appId -GraphToken $graphToken -LAToken $laToken
+
+    if ($auditData) {
+        $allAuditData += $auditData
+
+        # Write individual report
+        if (-not $SkipIndividualReports) {
+            $safeAppName    = $auditData.AppName -replace '[^a-zA-Z0-9]', '_'
+            $individualPath = Join-Path $OutputFolder "AppAudit_${safeAppName}.html"
+            New-IndividualReport -AuditData $auditData -OutputPath $individualPath
+            Write-Host "    Individual report: $individualPath" -ForegroundColor DarkGray
+        }
+    }
+}
+
+# Write summary report
+Write-Host "`n[4] Generating summary report..." -ForegroundColor Yellow
+$summaryPath = Join-Path $OutputFolder "AuditSummary.html"
+New-SummaryReport -AllAuditData $allAuditData -OutputPath $summaryPath
+Write-Host "    Summary report: $summaryPath" -ForegroundColor Green
+
+# Console summary
+Write-Host "`n================================================" -ForegroundColor Green
+Write-Host "  Audit complete!" -ForegroundColor Green
+Write-Host "================================================`n" -ForegroundColor Green
+
+$totalNeverUsed = ($allAuditData | ForEach-Object { ($_.AuditResults | Where-Object { $_.Status -eq "Never Used" }).Count } | Measure-Object -Sum).Sum
+
+Write-Host "SUMMARY" -ForegroundColor Cyan
+Write-Host "-------" -ForegroundColor Cyan
+Write-Host "Apps Audited        : $($allAuditData.Count)"
+Write-Host "Total Permissions   : $(($allAuditData | ForEach-Object { $_.AuditResults.Count } | Measure-Object -Sum).Sum)"
+Write-Host "Never-Used Perms    : $totalNeverUsed" -ForegroundColor $(if ($totalNeverUsed -gt 0) { "Red" } else { "Green" })
+Write-Host "Reports saved to    : $OutputFolder"
+Write-Host ""
+
+# Open summary report
+Write-Host "Opening summary report in browser..." -ForegroundColor Yellow
+if ($IsMacOS) {
+    & open $summaryPath
+} elseif ($IsLinux) {
+    & xdg-open $summaryPath
+} else {
+    Start-Process $summaryPath
+}
