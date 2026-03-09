@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>App Permission Audit — UserReadTest1</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #1a1a2e; }
+  .header { background: linear-gradient(135deg, #1F4E79 0%, #2E75B6 100%); color: white; padding: 32px 40px; }
+  .header h1 { font-size: 26px; font-weight: 700; margin-bottom: 6px; }
+  .header .sub { font-size: 14px; opacity: 0.85; }
+  .header .appid { font-size: 12px; opacity: 0.7; font-family: monospace; margin-top: 4px; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 30px 20px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 30px; }
+  .summary-card { background: white; border-radius: 10px; padding: 20px 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); border-top: 4px solid #2E75B6; }
+  .summary-card.red { border-top-color: #C0392B; }
+  .summary-card.green { border-top-color: #27AE60; }
+  .summary-card.orange { border-top-color: #E67E22; }
+  .summary-card .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  .summary-card .value { font-size: 32px; font-weight: 700; color: #1F4E79; margin-top: 4px; }
+  .summary-card.red .value { color: #C0392B; }
+  .summary-card.green .value { color: #27AE60; }
+  .summary-card.orange .value { color: #E67E22; }
+  .section { background: white; border-radius: 10px; padding: 24px; margin-bottom: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); }
+  .section h2 { font-size: 16px; font-weight: 700; color: #1F4E79; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 2px solid #D5E8F0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: #1F4E79; color: white; padding: 10px 14px; text-align: left; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  td { padding: 10px 14px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f8fbff; }
+  tr.row-unused td { background: #fff8f8; }
+  tr.row-unused:hover td { background: #fff0f0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge-active { background: #E8F8F0; color: #1E8449; }
+  .badge-unused { background: #FDEDEC; color: #C0392B; }
+  .badge-app { background: #EBF5FB; color: #1A5276; }
+  .badge-del { background: #F4ECF7; color: #6C3483; }
+  .fail-count { color: #C0392B; font-weight: 700; }
+  .never { color: #ccc; }
+  code { font-family: 'Consolas', monospace; font-size: 12px; color: #444; }
+  .recommendation { background: #FFFBF0; border-left: 4px solid #E67E22; padding: 16px 20px; border-radius: 0 8px 8px 0; margin-top: 16px; font-size: 13px; line-height: 1.6; }
+  .recommendation strong { color: #E67E22; }
+  .back-link { margin-bottom: 20px; }
+  .back-link a { color: #2E75B6; text-decoration: none; font-size: 13px; }
+  .back-link a:hover { text-decoration: underline; }
+  .footer { text-align: center; padding: 20px; font-size: 12px; color: #aaa; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>App Permission Audit Report</h1>
+  <div class="sub">Application: <strong>UserReadTest1</strong></div>
+  <div class="appid">App ID: c5690b36-01c9-4406-8c4c-920afb265716 &nbsp;|&nbsp; Lookback: 2 days &nbsp;|&nbsp; Generated: March 08, 2026 23:30</div>
+</div>
+<div class="container">
+  <div class="back-link"><a href="AuditSummary.html">← Back to Summary Report</a></div>
+  <div class="summary-grid">
+    <div class="summary-card"><div class="label">Registered Permissions</div><div class="value">3</div></div>
+    <div class="summary-card green"><div class="label">Active Permissions</div><div class="value">2</div></div>
+    <div class="summary-card red"><div class="label">Never Used</div><div class="value">1</div></div>
+    <div class="summary-card orange"><div class="label">Total API Calls (2 d)</div><div class="value">120</div></div>
+  </div>
+  <div class="section">
+    <h2>Registered Permissions vs. Observed Usage</h2>
+    <table>
+      <thead><tr><th>Permission</th><th>Type</th><th>Resource</th><th style="text-align:right">Total Calls</th><th style="text-align:right">Failed Calls</th><th>Last Used</th><th>Status</th></tr></thead>
+      <tbody>        <tr class="">
+            <td><strong>User.Read</strong></td>
+            <td><span class="badge badge-del">Delegated</span></td>
+            <td>Microsoft Graph</td>
+            <td class="num">69</td>
+            <td class="num">0</td>
+            <td>2026-03-08 19:49</td>
+            <td><span class="badge badge-active">Active</span></td>
+        </tr>        <tr class="">
+            <td><strong>User.Read.All</strong></td>
+            <td><span class="badge badge-app">Application</span></td>
+            <td>Microsoft Graph</td>
+            <td class="num">51</td>
+            <td class="num">0</td>
+            <td>2026-03-08 19:49</td>
+            <td><span class="badge badge-active">Active</span></td>
+        </tr>        <tr class="row-unused">
+            <td><strong>Mail.ReadWrite</strong></td>
+            <td><span class="badge badge-del">Delegated</span></td>
+            <td>Microsoft Graph</td>
+            <td class="num">0</td>
+            <td class="num">0</td>
+            <td><span class="never">—</span></td>
+            <td><span class="badge badge-unused">Never Used</span></td>
+        </tr></tbody>
+    </table>
+  </div>
+  <div class="section">
+    <h2>API Calls Without a Matched Permission (0 found)</h2>
+    <p style="font-size:13px;color:#666;margin-bottom:14px;">Endpoints observed in logs that could not be mapped to a known permission scope. Review and add to the permission map if needed.</p>
+    <table>
+      <thead><tr><th>Endpoint</th><th style="text-align:right">Calls</th><th>Last Used</th><th>Auth Type</th></tr></thead>
+      <tbody><tr><td colspan="4" style="text-align:center;color:#888;">No unmapped URIs found.</td></tr></tbody>
+    </table>
+  </div>
+  <div class="section">
+    <h2>Least Privilege Recommendations</h2>
+            <div class="recommendation">
+            <strong>⚠️ 1 permission(s) have never been used</strong> in the last 2 days.<br><br>
+            Consider removing the following permissions after confirming with the application owner:<br><br>
+            <ul style="margin-left:20px;margin-top:8px;">          <li><strong>Mail.ReadWrite</strong> (Delegated)</li></ul>
+        </div>
+    <div class="recommendation" style="background:#EBF5FB;border-color:#2E75B6;margin-top:12px;">
+      <strong>📋 Next Steps</strong><br><br>
+      1. Review never-used permissions with the application owner before removing.<br>
+      2. Extend the lookback period if the application runs infrequent scheduled tasks.<br>
+      3. Re-run this audit after removing permissions to confirm no application breakage.<br>
+      4. Schedule this script to run monthly for ongoing least-privilege governance.
+    </div>
+  </div>
+</div>
+<div class="footer">Entra ID App Permission Audit &nbsp;|&nbsp; Generated March 08, 2026 23:30 &nbsp;|&nbsp; Lookback: 2 days</div>
+</body>
+</html>
